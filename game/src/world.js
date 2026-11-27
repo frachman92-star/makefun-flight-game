@@ -1,238 +1,373 @@
-// The game's rules and state, with no drawing and no browser in it: the plane,
-// the pool of scrolling birds, balloons, rings and stars, spawning, collisions,
-// score, combo, lives and level. step() advances one fixed step and returns
-// what happened as bit flags, so the caller can react without the world knowing
-// about screens or sound. Nothing here allocates after createWorld returns.
-import { CLOUDS, FIELD, HAZARD, LEVEL, LIVES, PLAYER, POOL_SIZE, RING, STAR } from './config.js';
+// The game's rules and state, with no drawing and no browser in it: the aircraft
+// (throttle, bank, pitch, heading, fuel, damage), the rings and hazards ahead, the
+// missions (ring runs, a low river run, a runway landing, a waypoint dash), score,
+// combo, lives and levels. step() advances one fixed step and returns what happened
+// as bit flags, so the caller can react without the world knowing about screens or
+// sound. Nothing here allocates after createWorld returns.
+import {
+  CHUNK, DAMAGE, FUEL, HAZARD, LIVES, MISSIONS, PLANE, REPEAT, RING, RUNWAY, VIEW_DISTANCE,
+} from './config.js';
+import { riverCenterX } from './terrain.js';
 
-export const KIND_BIRD = 0;
-export const KIND_BALLOON = 1;
-export const KIND_RING = 2;
-export const KIND_STAR = 3;
+export const EVENT_RING = 1;
+export const EVENT_NEAR_MISS = 2;
+export const EVENT_HIT = 4;
+export const EVENT_LEVEL = 8;
+export const EVENT_OVER = 16;
+export const EVENT_LANDED = 32;
+export const EVENT_MISSION = 64;
+export const EVENT_LOWFUEL = 128;
 
-export const EVENT_HIT = 1;
-export const EVENT_PICKUP = 2;
-export const EVENT_RING = 4;
-export const EVENT_OVER = 8;
-export const EVENT_LEVEL = 16;
+const KIND_BIRD = 0;
+const KIND_BALLOON = 1;
 
-function overlaps(a, b) {
-  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
-export function createWorld(random) {
-  const player = {
-    x: PLAYER.x, y: (FIELD.groundY - PLAYER.height) / 2, width: PLAYER.width, height: PLAYER.height,
-    invulnerable: 0, vy: 0, tilt: 0, boost: false,
+/** The mission for a level: the list repeats, harder each time round. */
+export function missionForLevel(level) {
+  const base = MISSIONS[level % MISSIONS.length];
+  const repeat = Math.floor(level / MISSIONS.length);
+  return {
+    name: base.name,
+    goal: base.goal,
+    ringsTotal: base.rings + repeat * REPEAT.extraRings,
+    fuel: Math.max(REPEAT.minFuel, base.fuel - repeat * REPEAT.lessFuel),
+    lowRings: base.lowRings,
+    landing: base.landing,
+    runwayAhead: base.runwayAhead || 0,
+    waypointDistance: base.waypointDistance || 0,
   };
-  const items = [];
-  for (let index = 0; index < POOL_SIZE; index += 1) {
-    items.push({ active: false, kind: KIND_BIRD, x: 0, y: 0, width: 0, height: 0, speed: 0, phase: 0, passed: false });
-  }
-  const clouds = [];
-  for (let index = 0; index < CLOUDS; index += 1) {
-    clouds.push({ x: random() * FIELD.width, y: 30 + random() * 340, scale: 0.6 + random() * 0.9, speed: 18 + random() * 30 });
-  }
+}
+
+export function createWorld(random, seed) {
   const state = {
-    player, items, clouds, score: 0, lives: LIVES, level: 1, elapsed: 0, distance: 0,
-    combo: 0, bestCombo: 0, rings: 0, stars: 0, nearMiss: 0,
-    hazardTimer: 0, ringTimer: 0, starTimer: 0, scroll: 0,
+    seed,
+    time: 0,
+    score: 0,
+    lives: LIVES,
+    level: 0,
+    combo: 0,
+    bestCombo: 0,
+    x: 0,
+    altitude: PLANE.startAltitude,
+    z: 0,
+    speed: 130,
+    throttle: 0.6,
+    bank: 0,
+    pitch: 0,
+    heading: 90,
+    verticalSpeed: 0,
+    fuel: FUEL.start,
+    damage: 0,
+    invulnerable: 0,
+    shake: 0,
+    missionName: '',
+    missionGoal: '',
+    missionProgress: '',
+    ringsHit: 0,
+    ringsTotal: 0,
+    ringsSpawned: 0,
+    rings: [],
+    hazards: [],
+    nextRingZ: 0,
+    lastRingX: 0,
+    lastRingAlt: 60,
+    runway: null,
+    waypointZ: 0,
+    banner: '',
+    bannerKind: '',
+    bannerTime: 0,
+    levelComplete: false,
+    levelCompleteTimer: 0,
+    lowFuelWarned: false,
+    over: false,
+    crashed: false,
+    hazardTimer: 1.2,
+    balloonTimer: 3.0,
   };
+
+  function showBanner(text, kind, seconds) {
+    state.banner = text;
+    state.bannerKind = kind || '';
+    state.bannerTime = seconds || 2.2;
+  }
+
+  /** Set the aircraft and the course for one level of the mission list. */
+  function startLevel(level) {
+    const mission = missionForLevel(level);
+    state.level = level;
+    state.missionName = mission.name;
+    state.missionGoal = mission.goal;
+    state.ringsTotal = mission.ringsTotal;
+    state.ringsHit = 0;
+    state.combo = 0;
+    state.x = 0;
+    state.altitude = PLANE.startAltitude;
+    state.z = 0;
+    state.speed = 130;
+    state.throttle = 0.6;
+    state.bank = 0;
+    state.pitch = 0;
+    state.heading = 90;
+    state.verticalSpeed = 0;
+    state.fuel = mission.fuel;
+    state.damage = 0;
+    state.invulnerable = 0;
+    state.rings = [];
+    state.ringsSpawned = 0;
+    state.hazards = [];
+    state.nextRingZ = 150;
+    state.lastRingX = 0;
+    state.lastRingAlt = PLANE.startAltitude;
+    state.runway = mission.landing
+      ? { x: 0, z1: mission.runwayAhead, z2: mission.runwayAhead + RUNWAY.length }
+      : null;
+    state.waypointZ = mission.waypointDistance;
+    state.levelComplete = false;
+    state.levelCompleteTimer = 0;
+    state.lowFuelWarned = false;
+    state.crashed = false;
+    state.hazardTimer = 1.4;
+    state.balloonTimer = 3.5;
+    updateMissionProgress();
+    showBanner(`LEVEL ${level + 1}: ${mission.name}`, '', 2.4);
+  }
+
+  function updateMissionProgress() {
+    if (state.runway) {
+      state.missionProgress = state.ringsHit >= state.ringsTotal
+        ? 'LAND ON THE RUNWAY'
+        : `RINGS ${state.ringsHit}/${state.ringsTotal} THEN LAND`;
+    } else if (state.waypointZ > 0) {
+      state.missionProgress = `WAYPOINT ${Math.max(0, Math.round((state.waypointZ - state.z) / 10))} m · RINGS ${state.ringsHit}/${state.ringsTotal}`;
+    } else {
+      state.missionProgress = `RINGS ${state.ringsHit}/${state.ringsTotal}`;
+    }
+  }
 
   function reset() {
-    player.x = PLAYER.x;
-    player.y = (FIELD.groundY - PLAYER.height) / 2;
-    player.invulnerable = 0;
-    player.vy = 0;
-    player.tilt = 0;
-    for (const item of items) item.active = false;
+    state.time = 0;
     state.score = 0;
     state.lives = LIVES;
-    state.level = 1;
-    state.elapsed = 0;
-    state.distance = 0;
-    state.combo = 0;
-    state.bestCombo = 0;
-    state.rings = 0;
-    state.stars = 0;
-    state.nearMiss = 0;
-    state.hazardTimer = HAZARD.interval;
-    state.ringTimer = 1.0;
-    state.starTimer = 0.6;
-    state.scroll = 0;
+    state.over = false;
+    startLevel(0);
   }
 
-  function freeItem() {
-    for (let index = 0; index < items.length; index += 1) if (!items[index].active) return items[index];
+  /** The next ring the aircraft has not reached yet, or null when there is none. */
+  function nextRing() {
+    for (const ring of state.rings) {
+      if (!ring.passed) return ring;
+    }
     return null;
   }
 
-  function scrollSpeed() {
-    return HAZARD.baseSpeed + HAZARD.speedPerLevel * (state.level - 1);
-  }
-
-  function spawnHazard() {
-    const item = freeItem();
-    if (item === null) return;
-    const balloon = random() < 0.35;
-    item.active = true;
-    item.kind = balloon ? KIND_BALLOON : KIND_BIRD;
-    item.width = balloon ? HAZARD.balloonWidth : HAZARD.birdWidth;
-    item.height = balloon ? HAZARD.balloonHeight : HAZARD.birdHeight;
-    item.x = FIELD.width + 20;
-    item.y = 60 + random() * (FIELD.groundY - 140 - item.height);
-    item.speed = scrollSpeed() * (balloon ? 0.85 : 1.05) + random() * HAZARD.speedJitter;
-    item.phase = random() * Math.PI * 2;
-    item.passed = false;
-  }
-
   function spawnRing() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_RING;
-    item.width = RING.size;
-    item.height = RING.size;
-    item.x = FIELD.width + 20;
-    item.y = 70 + random() * (FIELD.groundY - 160 - item.height);
-    item.speed = scrollSpeed();
-    item.phase = 0;
-    item.passed = false;
+    const mission = missionForLevel(state.level);
+    const z = state.nextRingZ;
+    let x;
+    let alt;
+    if (mission.lowRings) {
+      x = riverCenterX(z) + (random() - 0.5) * 30;
+      alt = 25 + random() * 55;
+    } else {
+      x = clamp(state.lastRingX + (random() - 0.5) * 180, -260, 260);
+      alt = 40 + random() * 180;
+    }
+    state.rings.push({ x, alt, z, radius: RING.radius, passed: false, hit: false });
+    state.ringsSpawned += 1;
+    state.lastRingX = x;
+    state.lastRingAlt = alt;
+    state.nextRingZ = z + RING.spacing + (random() - 0.5) * RING.spacingJitter * 2;
   }
 
-  function spawnStar() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_STAR;
-    item.width = STAR.size;
-    item.height = STAR.size;
-    item.x = FIELD.width + 20;
-    item.y = 60 + random() * (FIELD.groundY - 140 - item.height);
-    item.speed = scrollSpeed();
-    item.phase = random() * Math.PI * 2;
-    item.passed = false;
+  function spawnHazard(balloon) {
+    const z = state.z + 650 + random() * 250;
+    state.hazards.push({
+      kind: balloon ? KIND_BALLOON : KIND_BIRD,
+      x: -280 + random() * 560,
+      alt: 20 + random() * 240,
+      z,
+      vx: (random() - 0.5) * (balloon ? HAZARD.balloonSpeed : HAZARD.birdSpeed),
+      phase: random() * Math.PI * 2,
+      passed: false,
+    });
   }
 
-  function hazardInterval() {
-    return Math.max(HAZARD.minInterval, HAZARD.interval * HAZARD.intervalScale ** (state.level - 1));
+  function completeMission(events) {
+    const bonus = 200 + Math.round(state.fuel) * 2;
+    state.score += bonus;
+    state.levelComplete = true;
+    state.levelCompleteTimer = 2.6;
+    showBanner(`MISSION COMPLETE  +${bonus}`, '', 2.6);
+    return events | EVENT_LEVEL;
   }
 
-  function comboMultiplier() {
-    return 1 + Math.min(4, Math.floor(state.combo / 3));
+  function crash(events) {
+    state.lives -= 1;
+    state.combo = 0;
+    state.damage = DAMAGE.max;
+    state.shake = 0.6;
+    showBanner(state.lives > 0 ? 'CRASHED' : 'GAME OVER', 'bad', 2.2);
+    if (state.lives <= 0) {
+      state.over = true;
+      return events | EVENT_HIT | EVENT_OVER;
+    }
+    startLevel(state.level);
+    state.invulnerable = 2;
+    showBanner('CRASHED', 'bad', 2.2);
+    return events | EVENT_HIT;
   }
 
   /**
-   * One fixed step. dirX / dirY are -1, 0 or 1. `boost` is Shift or Space held
-   * down: faster scroll and double distance points. With `harmless` set (the
-   * title screen's backdrop) things scroll but nothing touches the player and
-   * nothing scores.
+   * One fixed step. `input` is { throttle, bank, pitch } each -1, 0 or 1 (or in
+   * between from a pointer drag). With `harmless` set (the title screen's
+   * backdrop) things fly but nothing scores, breaks or ends.
    */
-  function step(dt, dirX, dirY, boost, harmless) {
+  function step(dt, input, harmless) {
     let events = 0;
-    state.elapsed += dt;
-    const level = Math.min(LEVEL.max, 1 + Math.floor(state.elapsed / LEVEL.seconds));
-    if (level !== state.level) {
-      state.level = level;
-      events |= EVENT_LEVEL;
+    state.time += dt;
+    if (state.bannerTime > 0) {
+      state.bannerTime -= dt;
+      if (state.bannerTime <= 0) state.banner = '';
+    }
+    if (state.invulnerable > 0) state.invulnerable = Math.max(0, state.invulnerable - dt);
+    if (state.shake > 0) state.shake = Math.max(0, state.shake - dt);
+
+    if (state.levelComplete) {
+      state.levelCompleteTimer -= dt;
+      if (state.levelCompleteTimer <= 0) {
+        startLevel(state.level + 1);
+        events |= EVENT_MISSION;
+      }
+      return events;
     }
 
-    const boostFactor = boost ? 1.55 : 1;
-    const speed = scrollSpeed() * boostFactor;
-    state.distance += speed * dt;
-    state.scroll += speed * dt;
-    if (!harmless) state.score += Math.floor(speed * dt * (boost ? 0.04 : 0.02));
+    // Throttle: W/S ease it up and down; an empty tank forces it to idle.
+    if (state.fuel > 0) {
+      state.throttle = clamp(state.throttle + input.throttle * dt * 0.8, 0, 1);
+    } else {
+      state.throttle = Math.max(0, state.throttle - dt * 0.5);
+    }
+    const targetSpeed = PLANE.minSpeed + state.throttle * (PLANE.maxSpeed - PLANE.minSpeed);
+    state.speed += (targetSpeed - state.speed) * Math.min(1, dt * 0.9);
 
-    // Smooth vertical steering: velocity eases toward the held direction.
-    const targetVy = dirY * PLAYER.speedY;
-    player.vy += (targetVy - player.vy) * Math.min(1, dt * 10);
-    player.y += player.vy * dt;
-    player.x += dirX * PLAYER.speedX * dt;
-    player.x = Math.min(420, Math.max(60, player.x));
-    player.y = Math.min(FIELD.groundY - player.height - 4, Math.max(24, player.y));
-    player.tilt = Math.max(-0.35, Math.min(0.35, player.vy / 1400));
-    player.boost = boost;
-    if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
+    // Bank turns the nose; the nose sets the lateral slide.
+    state.bank += clamp(input.bank - state.bank, -PLANE.bankApproach * dt, PLANE.bankApproach * dt);
+    state.heading = (state.heading + state.bank * PLANE.turnRate * dt + 360) % 360;
+    const headingRadians = (state.heading - 90) * Math.PI / 180;
+    state.x += (Math.sin(headingRadians) * state.speed + state.bank * state.speed * PLANE.bankSlide * 0.35) * dt;
+    state.x = clamp(state.x, -420, 420);
 
-    for (let index = 0; index < state.clouds.length; index += 1) {
-      const cloud = state.clouds[index];
-      cloud.x -= cloud.speed * dt * (0.4 + boostFactor * 0.3);
-      if (cloud.x < -180) {
-        cloud.x = FIELD.width + 40;
-        cloud.y = 30 + random() * 340;
+    // Pitch climbs and dives; an empty tank at low speed sinks the aircraft.
+    state.pitch += clamp(input.pitch - state.pitch, -dt * 3, dt * 3);
+    state.verticalSpeed = state.pitch * state.speed * PLANE.climbFactor;
+    if (state.fuel <= 0 && state.speed < PLANE.stallSpeed) {
+      state.verticalSpeed -= (PLANE.stallSpeed - state.speed) * 0.5;
+    }
+    state.altitude = clamp(state.altitude + state.verticalSpeed * dt, 0, PLANE.maxAltitude);
+    state.z += state.speed * dt;
+
+    if (!harmless) {
+      state.fuel = Math.max(0, state.fuel - (FUEL.drainIdle + state.throttle * FUEL.drainThrottle) * dt);
+      if (state.fuel < FUEL.lowWarning && !state.lowFuelWarned) {
+        state.lowFuelWarned = true;
+        events |= EVENT_LOWFUEL;
       }
     }
+
+    // Rings ahead, up to the edge of what the camera can see.
+    while (state.ringsSpawned < state.ringsTotal && state.nextRingZ < state.z + VIEW_DISTANCE) {
+      spawnRing();
+    }
+    state.rings = state.rings.filter((r) => r.z > state.z - 80);
 
     state.hazardTimer -= dt;
     if (state.hazardTimer <= 0) {
-      spawnHazard();
-      state.hazardTimer += hazardInterval();
+      spawnHazard(false);
+      state.hazardTimer += HAZARD.birdInterval + random() * 0.8;
     }
-    state.ringTimer -= dt;
-    if (state.ringTimer <= 0) {
-      spawnRing();
-      state.ringTimer += RING.interval + random() * RING.intervalJitter;
-    }
-    state.starTimer -= dt;
-    if (state.starTimer <= 0) {
-      spawnStar();
-      state.starTimer += STAR.interval + random() * STAR.intervalJitter;
+    state.balloonTimer -= dt;
+    if (state.balloonTimer <= 0) {
+      spawnHazard(true);
+      state.balloonTimer += HAZARD.balloonInterval + random() * 1.5;
     }
 
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      item.x -= item.speed * (boost ? 1.3 : 1) * dt;
-      if (item.kind === KIND_BALLOON) item.y += Math.sin(state.elapsed * 2 + item.phase) * 22 * dt;
-      if (item.kind === KIND_BIRD) item.y += Math.sin(state.elapsed * 6 + item.phase) * 30 * dt;
-      if (item.x + item.width < 0) {
-        item.active = false;
-        if (!item.passed && (item.kind === KIND_BIRD || item.kind === KIND_BALLOON) && !harmless) {
-          state.score += HAZARD.passPoints;
-        }
-        continue;
-      }
-      if (harmless || !overlaps(item, player)) {
-        // Near miss: a hazard that just cleared the plane's nose.
-        if (!harmless && !item.passed && (item.kind === KIND_BIRD || item.kind === KIND_BALLOON)
-          && item.x + item.width < player.x && item.x + item.width > player.x - 90
-          && Math.abs((item.y + item.height / 2) - (player.y + player.height / 2)) < 70) {
-          item.passed = true;
-          state.nearMiss += 1;
-          state.score += 5;
-        }
-        continue;
-      }
-      if (item.kind === KIND_RING) {
-        item.active = false;
-        state.rings += 1;
+    for (const ring of state.rings) {
+      if (ring.passed || ring.z > state.z) continue;
+      ring.passed = true;
+      const distance = Math.hypot(state.x - ring.x, state.altitude - ring.alt);
+      if (distance < ring.radius) {
+        ring.hit = true;
+        state.ringsHit += 1;
         state.combo += 1;
         state.bestCombo = Math.max(state.bestCombo, state.combo);
-        state.score += RING.points * comboMultiplier();
+        state.score += Math.round(RING.passPoints * (1 + Math.min(state.combo, 10) * 0.1));
         events |= EVENT_RING;
-      } else if (item.kind === KIND_STAR) {
-        item.active = false;
-        state.stars += 1;
-        state.combo += 1;
-        state.bestCombo = Math.max(state.bestCombo, state.combo);
-        state.score += STAR.points * comboMultiplier();
-        events |= EVENT_PICKUP;
-      } else if (player.invulnerable === 0) {
-        item.active = false;
-        item.passed = true;
-        state.lives -= 1;
+      } else if (distance < RING.nearMissRadius) {
+        state.score += RING.nearMissPoints;
+        events |= EVENT_NEAR_MISS;
+      } else {
         state.combo = 0;
-        player.invulnerable = PLAYER.invulnerable;
+      }
+      updateMissionProgress();
+    }
+
+    for (const hazard of state.hazards) {
+      if (hazard.passed) continue;
+      hazard.x += hazard.vx * dt;
+      if (hazard.z < state.z - 40) {
+        hazard.passed = true;
+        continue;
+      }
+      if (harmless || state.invulnerable > 0) continue;
+      if (Math.abs(hazard.z - state.z) > 8) continue;
+      const radius = hazard.kind === KIND_BALLOON ? HAZARD.balloonRadius : HAZARD.birdRadius;
+      if (Math.hypot(state.x - hazard.x, state.altitude - hazard.alt) < radius + 9) {
+        hazard.passed = true;
+        state.damage += DAMAGE.hit;
+        state.combo = 0;
+        state.invulnerable = 1.2;
+        state.shake = 0.4;
         events |= EVENT_HIT;
-        if (state.lives === 0) {
-          events |= EVENT_OVER;
-          break;
-        }
+        if (state.damage >= DAMAGE.max) return crash(events);
       }
     }
+    state.hazards = state.hazards.filter((h) => !h.passed && h.z > state.z - 60);
+
+    // The ground: a runway landing reads as a landing, anything else as a crash.
+    if (state.altitude <= 0.5 && !harmless) {
+      const runway = state.runway;
+      const onRunway = runway
+        && Math.abs(state.x) < RUNWAY.width / 2 - 2
+        && state.z >= runway.z1 && state.z <= runway.z2;
+      if (onRunway && state.speed < 150 && state.verticalSpeed > -35) {
+        state.score += 200;
+        events |= EVENT_LANDED;
+        events = completeMission(events);
+      } else {
+        return crash(events);
+      }
+    }
+
+    // The mission line is live: the waypoint distance counts down as you fly.
+    updateMissionProgress();
+    if (!harmless) {
+      if (state.runway && state.ringsHit >= state.ringsTotal && !state.levelComplete) {
+        updateMissionProgress();
+      }
+      if (!state.runway && state.waypointZ <= 0 && state.ringsHit >= state.ringsTotal && !state.levelComplete) {
+        events = completeMission(events);
+      }
+      if (state.waypointZ > 0 && state.z >= state.waypointZ && !state.levelComplete) {
+        events = completeMission(events);
+      }
+    }
+
     return events;
   }
 
   reset();
-  return { state, reset, step };
+  return { state, reset, startLevel, step, nextRing, missionForLevel };
 }

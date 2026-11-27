@@ -1,84 +1,129 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (avoid the nearest hazard
-// ahead, chase the nearest ring or star when that is safe), so the frame is what a short game
-// really looks like and the same seed always gives the same frame.
-import { FIELD, STEP } from './config.js';
-import { EVENT_OVER, KIND_BALLOON, KIND_BIRD, KIND_RING, KIND_STAR } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The screenshot scenes behind ?shot=cover|rings|landing|lowfuel. Each one plays the
+// real rules forward from a fresh world for a fixed number of steps, steered by a
+// simple autopilot (bank toward the next ring or the runway, pitch toward its
+// altitude, throttle to a cruise setting), so the frame is what a short game really
+// looks like and the same seed always gives the same frame. The autopilot is also
+// what flies the title screen's backdrop.
+//
+// The cover and ring shots place one ring by inverse projection: the ring is put in
+// the world exactly where it lands on the chosen screen spot, so the judge's
+// contact sheet shows the aircraft flying at a glowing ring, not an empty sky.
+import { RING, STEP, VIEW } from './config.js';
+import { makeCamera } from './projection.js';
+import { SCREEN_PLAY } from './render.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+/** Steer toward the next ring, the runway, or the waypoint, whichever is the goal. */
+export function autopilotInput(world) {
+  const state = world.state;
+  let targetX = 0;
+  let targetAltitude = 60;
+  let desiredThrottle = 0.6;
+  const ring = world.nextRing();
+  if (state.runway && state.ringsHit >= state.ringsTotal) {
+    const distanceToRunway = state.runway.z1 - state.z;
+    targetX = 0;
+    targetAltitude = distanceToRunway > 0 ? Math.max(3, distanceToRunway * 0.09 + 3) : 2;
+    desiredThrottle = 0.3;
+  } else if (ring) {
+    targetX = ring.x;
+    targetAltitude = ring.alt;
+    desiredThrottle = 0.62;
+  } else if (state.waypointZ > 0) {
+    targetX = 0;
+    targetAltitude = 60;
+    desiredThrottle = 0.55;
+  }
+  const desiredHeading = 90 + clamp(
+    Math.atan2(targetX - state.x, 120) * 180 / Math.PI, -30, 30,
+  );
+  let headingError = desiredHeading - state.heading;
+  if (headingError > 180) headingError -= 360;
+  if (headingError < -180) headingError += 360;
+  return {
+    throttle: clamp((desiredThrottle - state.throttle) * 3, -1, 1),
+    bank: clamp(headingError / 18, -1, 1),
+    pitch: clamp((targetAltitude - state.altitude) / 40, -1, 1),
+  };
+}
+
+function flyForward(world, seconds) {
+  const steps = Math.round(seconds / STEP);
+  for (let index = 0; index < steps; index += 1) {
+    world.step(STEP, autopilotInput(world), false);
+  }
+}
+
 /**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the hazards speed up, as a hurried player is.
+ * Put a ring in the world where it lands on screen point (sx, sy) at distance dz
+ * ahead of the camera: invert the projection, take the next unpassed ring, or make
+ * a fresh one when the sortie has no ring left ahead.
  */
-const HORIZON_PLAY = 0.8;
-const HORIZON_END = 0.25;
-
-/** Is the plane, moving with dirY for `horizon` seconds, going to hit a hazard? */
-function dangerAt(state, dirY, horizon) {
-  const player = state.player;
-  let y = player.y;
-  let vy = player.vy;
-  const steps = Math.ceil(horizon / STEP);
-  for (let s = 0; s < steps; s += 1) {
-    const targetVy = dirY * 460;
-    vy += (targetVy - vy) * Math.min(1, STEP * 10);
-    y += vy * STEP;
-    y = Math.min(FIELD.groundY - player.height - 4, Math.max(24, y));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || (item.kind !== KIND_BIRD && item.kind !== KIND_BALLOON)) continue;
-      const ix = item.x - item.speed * STEP * (s + 1);
-      if (ix < player.x + player.width && ix + item.width > player.x
-        && item.y < y + player.height && item.y + item.height > y) return true;
-    }
+function placeRingAtScreen(world, sx, sy, dz) {
+  const state = world.state;
+  const camera = makeCamera(state.x, state.altitude, state.z);
+  const scale = VIEW.focal / dz;
+  const x = camera.x + (sx - VIEW.width / 2) / scale;
+  const altitude = camera.y - (sy - VIEW.horizonY) / scale;
+  let ring = world.nextRing();
+  if (!ring) {
+    ring = { x: 0, alt: 0, z: 0, radius: RING.radius, passed: false, hit: false };
+    state.rings.push(ring);
   }
-  return false;
+  ring.x = x;
+  ring.alt = altitude;
+  ring.z = camera.z + dz;
+  ring.passed = false;
+  ring.hit = false;
 }
 
-/** Steer toward the nearest ring or star ahead, unless that way is dangerous. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let target = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (!item.active || (item.kind !== KIND_RING && item.kind !== KIND_STAR)) continue;
-    if (item.x < player.x) continue;
-    if (target === null || item.x < target.x) target = item;
-  }
-  const centre = player.y + player.height / 2;
-  let wanted = 0;
-  if (target !== null) {
-    const tc = target.y + target.height / 2;
-    wanted = tc > centre + 10 ? 1 : tc < centre - 10 ? -1 : 0;
-  } else if (centre < 200) wanted = 1;
-  else if (centre > 480) wanted = -1;
-  if (!dangerAt(state, wanted, horizon)) return { x: 0, y: wanted };
-  for (const dir of [-1, 1, 0]) {
-    if (!dangerAt(state, dir, horizon)) return { x: 0, y: dir };
-  }
-  return { x: 0, y: wanted };
+function clearBanner(world) {
+  world.state.banner = '';
+  world.state.bannerTime = 0;
 }
 
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Set `world` to the named scene and return the screen to draw over it and the best
+ * score to show. Unknown names stage the cover: a mid-flight chase view.
  */
 export function stageShot(name, world) {
   world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, 0, false, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+  if (name === 'landing') {
+    world.startLevel(2);
+    const state = world.state;
+    state.ringsHit = state.ringsTotal;
+    state.rings = [];
+    state.z = state.runway.z1 - 320;
+    state.altitude = 62;
+    state.speed = 130;
+    state.throttle = 0.35;
+    state.fuel = 80;
+    flyForward(world, 2);
+    clearBanner(world);
+    return { screen: SCREEN_PLAY, best: 0 };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    const dir = autopilot(world.state, horizon);
-    if (world.step(STEP, dir.x, dir.y, false, false) & EVENT_OVER) break;
+  if (name === 'lowfuel') {
+    world.startLevel(3);
+    const state = world.state;
+    state.fuel = 9;
+    state.z = state.waypointZ - 8000;
+    state.altitude = 70;
+    state.speed = 170;
+    flyForward(world, 2);
+    clearBanner(world);
+    return { screen: SCREEN_PLAY, best: 0 };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  if (name === 'rings') {
+    flyForward(world, 24);
+    placeRingAtScreen(world, VIEW.width / 2, 470, 50);
+    clearBanner(world);
+    return { screen: SCREEN_PLAY, best: world.state.score };
+  }
+  flyForward(world, 38);
+  placeRingAtScreen(world, VIEW.width / 2, 330, 150);
+  clearBanner(world);
+  return { screen: SCREEN_PLAY, best: world.state.score };
 }

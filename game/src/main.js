@@ -1,17 +1,23 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over. Sound is a tiny WebAudio synth
-// (no files): a chime for rings, a soft blip for stars, a thud for a hit, a rising arpeggio on
-// level up, all after the first user gesture.
+// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s
+// steps (several in a slow frame, none in a fast one), and the renderer paints what is
+// there. The game moves between four screens: title, play, paused and game over. Sound
+// is a tiny WebAudio synth (no files): a chime for rings, a soft blip for a near miss,
+// a thud for a hit, a fanfare on mission complete, a chime for a landing, all after
+// the first user gesture. On the title screen an autopilot flies the backdrop.
 //
-// ?seed=N fixes the flight pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, FIELD, LIVES, STEP } from './config.js';
+// ?seed=N fixes the flight pattern. ?shot=cover|rings|landing|lowfuel (with &seed=N)
+// stages that scene instead of running the loop, paints it twice and sets
+// window.__shotReady for a screenshot.
+import { BEST_KEY, LIVES, STEP } from './config.js';
 import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_LEVEL, EVENT_OVER, EVENT_PICKUP, EVENT_RING } from './world.js';
+import {
+  createWorld, EVENT_HIT, EVENT_LANDED, EVENT_LEVEL, EVENT_LOWFUEL,
+  EVENT_NEAR_MISS, EVENT_OVER, EVENT_RING,
+} from './world.js';
 import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
+import { createAudio } from './audio.js';
 import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
-import { stageShot } from './shots.js';
+import { autopilotInput, stageShot } from './shots.js';
 
 /** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
 const MAX_FRAME = 0.25;
@@ -23,41 +29,9 @@ const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() 
 
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
+const world = createWorld(createRandom(seed), seed);
 const renderer = createRenderer(canvas);
-
-let audio = null;
-function ensureAudio() {
-  if (audio) return;
-  try {
-    audio = new (window.AudioContext || window.webkitAudioContext)();
-  } catch {
-    audio = null;
-  }
-}
-function tone(freq, dur, type, gain) {
-  if (!audio) return;
-  try {
-    const osc = audio.createOscillator();
-    const amp = audio.createGain();
-    osc.type = type || 'sine';
-    osc.frequency.value = freq;
-    amp.gain.setValueAtTime(gain || 0.08, audio.currentTime);
-    amp.gain.exponentialRampToValueAtTime(0.001, audio.currentTime + dur);
-    osc.connect(amp);
-    amp.connect(audio.destination);
-    osc.start();
-    osc.stop(audio.currentTime + dur);
-  } catch {
-    // Sound is decoration: never let it break the game.
-  }
-}
-function soundFor(events) {
-  if (events & EVENT_RING) { tone(880, 0.18, 'sine', 0.09); setTimeout(() => tone(1320, 0.22, 'sine', 0.09), 70); }
-  else if (events & EVENT_PICKUP) tone(660, 0.1, 'sine', 0.06);
-  if (events & EVENT_HIT) tone(140, 0.25, 'sawtooth', 0.1);
-  if (events & EVENT_LEVEL) { tone(523, 0.12, 'triangle', 0.07); setTimeout(() => tone(784, 0.16, 'triangle', 0.07), 90); }
-}
+const audio = createAudio();
 
 function readBest() {
   try {
@@ -75,11 +49,27 @@ function saveBest(value) {
   }
 }
 
+function soundFor(events) {
+  if (events & EVENT_RING) {
+    audio.ringChime();
+    renderer.addPopup('+25');
+  } else if (events & EVENT_NEAR_MISS) {
+    audio.nearMissBlip();
+    renderer.addPopup('+5 NEAR MISS');
+  }
+  if (events & EVENT_HIT) audio.hitThud();
+  if (events & EVENT_LEVEL) audio.missionFanfare();
+  if (events & EVENT_LANDED) audio.landingChime();
+  if (events & EVENT_LOWFUEL) audio.lowFuelBeep();
+}
+
 function runShot(name) {
   const scene = stageShot(name, world);
+  // For debugging and verification: the staged state, readable from outside the page.
+  window.__skyRush = { world, screen: scene.screen };
   let painted = 0;
   function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
+    renderer.draw(world, scene.screen, scene.best, STEP);
     painted += 1;
     if (painted < 2) requestAnimationFrame(paint);
     else window.__shotReady = true;
@@ -100,7 +90,7 @@ function runGame() {
   }
 
   function startGame() {
-    ensureAudio();
+    audio.ensure();
     world.reset();
     accumulator = 0;
     screen = SCREEN_PLAY;
@@ -130,24 +120,17 @@ function runGame() {
 
   function step() {
     if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, 0, false, true);
+      world.step(STEP, autopilotInput(world), true);
       return;
     }
-    let dirX = input.directionX();
-    let dirY = input.directionY();
-    const pointer = input.pointerTarget();
-    if (pointer !== null) {
-      const player = world.state.player;
-      const cx = player.x + player.width / 2;
-      const cy = player.y + player.height / 2;
-      dirX = Math.max(-1, Math.min(1, (pointer.x * FIELD.width - cx) / 90));
-      dirY = Math.max(-1, Math.min(1, (pointer.y * FIELD.height - cy) / 70));
-    }
-    const events = world.step(STEP, dirX, dirY, input.isBoost(), false);
+    const events = world.step(STEP, input.stick(), false);
+    audio.setEngine(world.state.throttle, screen === SCREEN_PLAY);
     soundFor(events);
     if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
-    else if (events & EVENT_RING) announce(`Ring! Score ${world.state.score}.`);
+    else if (events & EVENT_HIT) {
+      announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
+    } else if (events & EVENT_RING) announce(`Ring! Score ${world.state.score}.`);
+    else if (events & EVENT_LANDED) announce(`Landed! Score ${world.state.score}.`);
   }
 
   function frame(now) {
@@ -163,7 +146,7 @@ function runGame() {
     } else {
       accumulator = 0;
     }
-    renderer.draw(world.state, screen, best);
+    renderer.draw(world, screen, best, STEP);
   }
 
   // Leaving the tab pauses a running game rather than letting hazards fly unseen.
@@ -173,6 +156,9 @@ function runGame() {
       announce('Paused.');
     }
   });
+
+  // For the playtest: the live state, readable from outside the page.
+  window.__skyRush = { world, get screen() { return screen; } };
 
   announce('Sky Rush. Press Enter or tap to take off.');
   requestAnimationFrame(frame);

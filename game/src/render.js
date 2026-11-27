@@ -1,8 +1,13 @@
-// Drawing only: the world's state and the current screen in, pixels out. The 1280x720 playfield
-// is scaled to fit the window and centred, the margin filled with the backdrop colour.
-// Canvas shapes and gradients, no images and no network, canvas text for the HUD and panels.
-import { FIELD, FONT, LIVES, PALETTE } from './config.js';
-import { KIND_BALLOON, KIND_BIRD, KIND_RING, KIND_STAR } from './world.js';
+// Drawing only: the world's state and the current screen in, pixels out. The 1280x720
+// playfield is scaled to fit the window and centred. One frame is the sky and
+// mountains, the terrain below, the rings and hazards ahead, the waypoint beacon, the
+// aircraft seen from behind, then the lit instrument HUD or a panel for the screen
+// the game is on. Canvas shapes and gradients, no images and no network.
+import { FONT, PALETTE, VIEW } from './config.js';
+import { makeCamera, projectPoint } from './projection.js';
+import { drawSky, drawTerrain, drawWaypointBeacon } from './terrain.js';
+import { drawChaseViewAircraft } from './aircraft.js';
+import { drawLitInstrumentHud } from './hud.js';
 
 export const SCREEN_TITLE = 'title';
 export const SCREEN_PLAY = 'play';
@@ -10,29 +15,12 @@ export const SCREEN_PAUSED = 'paused';
 export const SCREEN_OVER = 'over';
 
 /** The panel's width; its height grows with its lines: room for the title, the lines and the prompt. */
-const PANEL = { width: 660, top: 138, line: 34, bottom: 72 };
-
-function cachedLabel(prefix) {
-  let value = -1;
-  let text = '';
-  return function label(next) {
-    if (next !== value) {
-      value = next;
-      text = prefix + next;
-    }
-    return text;
-  };
-}
+const PANEL = { width: 680, top: 148, line: 34, bottom: 74 };
 
 export function createRenderer(canvas) {
   const context = canvas.getContext('2d');
   const view = { scale: 1, x: 0, y: 0 };
-  const scoreLabel = cachedLabel('Score ');
-  const levelLabel = cachedLabel('Level ');
-  const comboLabel = cachedLabel('Combo x');
-  const finalLabel = cachedLabel('Score ');
-  const bestLabel = cachedLabel('Best ');
-  const ringLabel = cachedLabel('Rings ');
+  const popups = [];
 
   function resize() {
     const ratio = window.devicePixelRatio || 1;
@@ -40,9 +28,9 @@ export function createRenderer(canvas) {
     const height = Math.round(window.innerHeight * ratio);
     canvas.width = width;
     canvas.height = height;
-    view.scale = Math.min(width / FIELD.width, height / FIELD.height);
-    view.x = (width - FIELD.width * view.scale) / 2;
-    view.y = (height - FIELD.height * view.scale) / 2;
+    view.scale = Math.min(width / VIEW.width, height / VIEW.height);
+    view.x = (width - VIEW.width * view.scale) / 2;
+    view.y = (height - VIEW.height * view.scale) / 2;
   }
 
   const fonts = new Map();
@@ -55,272 +43,189 @@ export function createRenderer(canvas) {
     context.fillText(value, x, y);
   }
 
-  function drawSky(state) {
-    const grad = context.createLinearGradient(0, 0, 0, FIELD.height);
-    grad.addColorStop(0, PALETTE.skyTop);
-    grad.addColorStop(0.55, PALETTE.skyMid);
-    grad.addColorStop(1, PALETTE.skyBottom);
-    context.fillStyle = grad;
-    context.fillRect(0, 0, FIELD.width, FIELD.height);
-
-    // Sun with a soft glow, top right.
-    const glow = context.createRadialGradient(1120, 110, 10, 1120, 110, 130);
-    glow.addColorStop(0, PALETTE.sunGlow);
-    glow.addColorStop(1, 'rgba(255,243,176,0)');
-    context.fillStyle = glow;
-    context.fillRect(990, -20, 260, 260);
-    context.fillStyle = PALETTE.sun;
-    context.beginPath();
-    context.arc(1120, 110, 44, 0, Math.PI * 2);
-    context.fill();
-
-    // Far mountains, parallax by scroll.
-    context.fillStyle = PALETTE.mountainFar;
-    context.beginPath();
-    context.moveTo(0, FIELD.groundY);
-    const farOff = (state.scroll * 0.08) % 640;
-    for (let x = -640; x < FIELD.width + 640; x += 320) {
-      context.lineTo(x - farOff + 160, 470);
-      context.lineTo(x - farOff + 320, FIELD.groundY);
-    }
-    context.lineTo(FIELD.width, FIELD.groundY);
-    context.closePath();
-    context.fill();
-
-    // Near hills.
-    context.fillStyle = PALETTE.mountainNear;
-    context.beginPath();
-    context.moveTo(0, FIELD.groundY);
-    const nearOff = (state.scroll * 0.18) % 480;
-    for (let x = -480; x < FIELD.width + 480; x += 240) {
-      context.lineTo(x - nearOff + 120, 570);
-      context.lineTo(x - nearOff + 240, FIELD.groundY);
-    }
-    context.lineTo(FIELD.width, FIELD.groundY);
-    context.closePath();
-    context.fill();
-
-    // Clouds.
-    context.fillStyle = 'rgba(255,255,255,0.92)';
-    for (let index = 0; index < state.clouds.length; index += 1) {
-      const cloud = state.clouds[index];
-      const s = cloud.scale;
-      context.beginPath();
-      context.arc(cloud.x, cloud.y, 26 * s, 0, Math.PI * 2);
-      context.arc(cloud.x + 30 * s, cloud.y + 6 * s, 20 * s, 0, Math.PI * 2);
-      context.arc(cloud.x - 30 * s, cloud.y + 8 * s, 18 * s, 0, Math.PI * 2);
-      context.fill();
-    }
-
-    // Ground strip.
-    context.fillStyle = PALETTE.ground;
-    context.fillRect(0, FIELD.groundY, FIELD.width, FIELD.height - FIELD.groundY);
-    context.fillStyle = PALETTE.groundDark;
-    context.fillRect(0, FIELD.groundY, FIELD.width, 6);
+  /** Where the aircraft sits on screen: centred, banking sideways, pitching up and down. */
+  function aircraftScreenPosition(state) {
+    const px = VIEW.width / 2 + state.bank * 46;
+    const py = Math.max(380, Math.min(560, 470 + state.pitch * 16 - (state.altitude - 60) * 0.22));
+    return { px, py };
   }
 
-  function drawPlane(player, elapsed) {
-    if (player.invulnerable === 0 || Math.floor(player.invulnerable * 10) % 2 === 1) {
-      const cx = player.x + player.width / 2;
-      const cy = player.y + player.height / 2;
+  function drawRing(ctx, camera, ring, time) {
+    const at = projectPoint(camera, ring.x, ring.alt, ring.z);
+    if (!at) return;
+    const radius = Math.max(3, ring.radius * at.scale);
+    const pulse = 1 + Math.sin(time * 5) * 0.06;
+    ctx.save();
+    ctx.shadowColor = PALETTE.ring;
+    ctx.shadowBlur = 18;
+    ctx.strokeStyle = PALETTE.ring;
+    ctx.lineWidth = Math.max(2, 5 * at.scale);
+    ctx.beginPath();
+    ctx.arc(at.x, at.y, radius * pulse, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = PALETTE.ringInner;
+    ctx.lineWidth = Math.max(1, 1.6 * at.scale);
+    ctx.beginPath();
+    ctx.arc(at.x, at.y, radius * pulse, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+    if (at.scale < 1.4) {
+      ctx.fillStyle = PALETTE.ringInner;
+      ctx.beginPath();
+      ctx.moveTo(at.x, at.y - radius - 16);
+      ctx.lineTo(at.x - 7, at.y - radius - 6);
+      ctx.lineTo(at.x + 7, at.y - radius - 6);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  function drawBird(ctx, camera, hazard, time) {
+    const at = projectPoint(camera, hazard.x, hazard.alt + Math.sin(time * 6 + hazard.phase) * 3, hazard.z);
+    if (!at) return;
+    const s = Math.max(0.4, at.scale);
+    const flap = Math.sin(time * 10 + hazard.phase) * 8 * s;
+    ctx.fillStyle = PALETTE.bird;
+    ctx.beginPath();
+    ctx.ellipse(at.x, at.y, 13 * s, 6 * s, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(at.x - 4 * s, at.y - 2 * s);
+    ctx.lineTo(at.x - 14 * s, at.y - 10 * s - flap);
+    ctx.lineTo(at.x + 2 * s, at.y - 4 * s);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(at.x + 4 * s, at.y - 2 * s);
+    ctx.lineTo(at.x + 14 * s, at.y - 10 * s - flap);
+    ctx.lineTo(at.x + 10 * s, at.y - 4 * s);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawBalloon(ctx, camera, hazard, time) {
+    const bob = Math.sin(time * 2 + hazard.phase) * 4;
+    const at = projectPoint(camera, hazard.x, hazard.alt + bob, hazard.z);
+    if (!at) return;
+    const s = Math.max(0.4, at.scale);
+    ctx.fillStyle = PALETTE.balloon;
+    ctx.beginPath();
+    ctx.ellipse(at.x, at.y - 8 * s, 15 * s, 18 * s, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+    ctx.lineWidth = Math.max(1, 1.2 * s);
+    ctx.beginPath();
+    ctx.moveTo(at.x - 8 * s, at.y - 22 * s);
+    ctx.lineTo(at.x - 5 * s, at.y + 8 * s);
+    ctx.moveTo(at.x + 8 * s, at.y - 22 * s);
+    ctx.lineTo(at.x + 5 * s, at.y + 8 * s);
+    ctx.stroke();
+    ctx.fillStyle = PALETTE.balloonBasket;
+    ctx.fillRect(at.x - 6 * s, at.y + 8 * s, 12 * s, 8 * s);
+  }
+
+  function drawPopups(dt) {
+    for (let i = popups.length - 1; i >= 0; i -= 1) {
+      const popup = popups[i];
+      popup.ttl -= dt;
+      if (popup.ttl <= 0) {
+        popups.splice(i, 1);
+        continue;
+      }
+      popup.y -= 34 * dt;
       context.save();
-      context.translate(cx, cy);
-      context.rotate(player.tilt);
-      // Tail wing.
-      context.fillStyle = PALETTE.playerWing;
-      context.beginPath();
-      context.moveTo(-34, -4);
-      context.lineTo(-22, -18);
-      context.lineTo(-12, -4);
-      context.closePath();
-      context.fill();
-      // Main wing.
-      context.fillStyle = PALETTE.playerWing;
-      context.beginPath();
-      context.moveTo(-6, -2);
-      context.lineTo(6, -26);
-      context.lineTo(18, -2);
-      context.closePath();
-      context.fill();
-      // Fuselage.
-      context.fillStyle = PALETTE.player;
-      context.beginPath();
-      context.ellipse(0, 0, 42, 13, 0, 0, Math.PI * 2);
-      context.fill();
-      // Cockpit.
-      context.fillStyle = PALETTE.cockpit;
-      context.beginPath();
-      context.ellipse(12, -6, 14, 8, -0.15, 0, Math.PI * 2);
-      context.fill();
-      // Propeller, spinning with time.
-      const spin = elapsed * 30;
-      context.strokeStyle = PALETTE.propeller;
-      context.lineWidth = 4;
-      context.beginPath();
-      context.moveTo(42, -Math.sin(spin) * 20);
-      context.lineTo(42, Math.sin(spin) * 20);
-      context.moveTo(42, -Math.cos(spin) * 20);
-      context.lineTo(42, Math.cos(spin) * 20);
-      context.stroke();
-      context.fillStyle = PALETTE.propeller;
-      context.beginPath();
-      context.arc(42, 0, 4, 0, Math.PI * 2);
-      context.fill();
+      context.globalAlpha = Math.min(1, popup.ttl);
+      context.textAlign = 'center';
+      context.font = `800 26px ${FONT}`;
+      context.shadowColor = PALETTE.ring;
+      context.shadowBlur = 12;
+      context.fillStyle = '#ffe98a';
+      context.fillText(popup.text, popup.x, popup.y);
       context.restore();
-      // Boost flame.
-      if (player.boost) {
-        context.fillStyle = '#ffb347';
-        context.beginPath();
-        context.moveTo(player.x - 2, cy - 6);
-        context.lineTo(player.x - 26 - Math.random() * 10, cy);
-        context.lineTo(player.x - 2, cy + 6);
-        context.closePath();
-        context.fill();
-      }
     }
-  }
-
-  function drawItems(state) {
-    const items = state.items;
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      const cx = item.x + item.width / 2;
-      const cy = item.y + item.height / 2;
-      if (item.kind === KIND_RING) {
-        context.strokeStyle = PALETTE.ring;
-        context.lineWidth = 9;
-        context.beginPath();
-        context.arc(cx, cy, item.width / 2 - 4, 0, Math.PI * 2);
-        context.stroke();
-        context.strokeStyle = PALETTE.ringInner;
-        context.lineWidth = 3;
-        context.beginPath();
-        context.arc(cx, cy, item.width / 2 - 4, 0, Math.PI * 2);
-        context.stroke();
-      } else if (item.kind === KIND_STAR) {
-        context.fillStyle = PALETTE.star;
-        context.beginPath();
-        for (let p = 0; p < 10; p += 1) {
-          const r = p % 2 === 0 ? 13 : 6;
-          const a = -Math.PI / 2 + (p * Math.PI) / 5;
-          const px = cx + Math.cos(a) * r;
-          const py = cy + Math.sin(a) * r;
-          if (p === 0) context.moveTo(px, py);
-          else context.lineTo(px, py);
-        }
-        context.closePath();
-        context.fill();
-      } else if (item.kind === KIND_BIRD) {
-        const flap = Math.sin(state.elapsed * 10 + item.phase) * 10;
-        context.fillStyle = PALETTE.bird;
-        context.beginPath();
-        context.ellipse(cx, cy, 22, 10, 0, 0, Math.PI * 2);
-        context.fill();
-        context.beginPath();
-        context.moveTo(cx - 6, cy - 4);
-        context.lineTo(cx - 18, cy - 16 - flap);
-        context.lineTo(cx + 2, cy - 8);
-        context.closePath();
-        context.fill();
-        context.beginPath();
-        context.moveTo(cx + 4, cy - 4);
-        context.lineTo(cx + 16, cy - 14 - flap);
-        context.lineTo(cx + 10, cy - 6);
-        context.closePath();
-        context.fill();
-        context.fillStyle = '#ffd94d';
-        context.beginPath();
-        context.arc(cx + 18, cy - 2, 3, 0, Math.PI * 2);
-        context.fill();
-      } else if (item.kind === KIND_BALLOON) {
-        context.fillStyle = PALETTE.balloon;
-        context.beginPath();
-        context.ellipse(cx, cy - 12, 26, 30, 0, 0, Math.PI * 2);
-        context.fill();
-        context.strokeStyle = 'rgba(255,255,255,0.7)';
-        context.lineWidth = 2;
-        context.beginPath();
-        context.moveTo(cx - 12, cy - 38);
-        context.lineTo(cx - 8, cy + 8);
-        context.moveTo(cx + 12, cy - 38);
-        context.lineTo(cx + 8, cy + 8);
-        context.stroke();
-        context.fillStyle = PALETTE.balloonBasket;
-        context.fillRect(cx - 9, cy + 8, 18, 12);
-      }
-    }
-  }
-
-  function drawHud(state) {
-    context.textBaseline = 'top';
-    text(scoreLabel(state.score), 24, 18, 30, PALETTE.text, 'left', true);
-    text(levelLabel(state.level), FIELD.width / 2, 18, 26, PALETTE.text, 'center', true);
-    if (state.combo >= 2) {
-      text(comboLabel(1 + Math.min(4, Math.floor(state.combo / 3))), FIELD.width / 2, 52, 22, PALETTE.ring, 'center', true);
-    }
-    const firstLife = FIELD.width - 24 - LIVES * 28;
-    text('Lives', firstLife - 14, 18, 26, PALETTE.text, 'right', true);
-    for (let life = 0; life < LIVES; life += 1) {
-      const x = firstLife + life * 28;
-      context.fillStyle = life < state.lives ? PALETTE.player : 'rgba(255,255,255,0.35)';
-      context.beginPath();
-      context.arc(x + 10, 32, 9, 0, Math.PI * 2);
-      context.fill();
-      context.fillStyle = life < state.lives ? '#ffffff' : 'rgba(255,255,255,0.35)';
-      context.beginPath();
-      context.arc(x + 10, 32, 3, 0, Math.PI * 2);
-      context.fill();
-    }
-    text(ringLabel(state.rings), 24, 56, 20, PALETTE.ringInner, 'left', false);
   }
 
   function drawPanel(title, lines, prompt) {
     const height = PANEL.top + lines.length * PANEL.line + PANEL.bottom;
-    const x = (FIELD.width - PANEL.width) / 2;
-    const y = (FIELD.height - height) / 2;
-    context.fillStyle = PALETTE.panel;
+    const x = (VIEW.width - PANEL.width) / 2;
+    const y = (VIEW.height - height) / 2;
+    context.fillStyle = 'rgba(16,35,58,0.92)';
     context.fillRect(x, y, PANEL.width, height);
     context.strokeStyle = PALETTE.panelEdge;
     context.lineWidth = 3;
     context.strokeRect(x, y, PANEL.width, height);
     context.textBaseline = 'alphabetic';
-    text(title, FIELD.width / 2, y + 82, 52, PALETTE.text, 'center', true);
+    text(title, VIEW.width / 2, y + 84, 52, PALETTE.text, 'center', true);
     for (let index = 0; index < lines.length; index += 1) {
-      text(lines[index], FIELD.width / 2, y + PANEL.top + index * PANEL.line, 22, PALETTE.muted, 'center', false);
+      text(lines[index], VIEW.width / 2, y + PANEL.top + index * PANEL.line, 21, PALETTE.muted, 'center', false);
     }
-    text(prompt, FIELD.width / 2, y + height - 38, 24, PALETTE.ring, 'center', true);
+    text(prompt, VIEW.width / 2, y + height - 36, 24, PALETTE.ring, 'center', true);
   }
 
-  const TITLE_LINES = ['Fly through the gold rings. Dodge the birds and balloons.', 'Steer with arrows or WASD, or drag the plane. Shift is boost.', ''];
-  const PAUSED_LINES = ['The sky will wait for you.'];
-  const OVER_LINES = ['', '', ''];
+  const TITLE_LINES = [
+    'A chase-view flight game: fly the rings, mind the fuel, land the runway.',
+    'W / S throttle  ·  A / D or arrows bank  ·  Up / Down pitch  ·  drag also steers',
+    'P pauses. Fly through gold rings, dodge birds and balloons.',
+  ];
 
-  /** Paint one frame: the sky, then the HUD or a panel for the screen the game is on. */
-  function draw(state, screen, best) {
+  /** Paint one frame: sky, terrain, objects, aircraft, HUD or a panel. */
+  function draw(world, screen, best, dt) {
+    const state = world.state;
+    const camera = makeCamera(state.x, state.altitude, state.z);
     context.setTransform(1, 0, 0, 1, 0, 0);
-    context.fillStyle = PALETTE.backdrop;
+    context.fillStyle = '#0e2a4a';
     context.fillRect(0, 0, canvas.width, canvas.height);
     context.setTransform(view.scale, 0, 0, view.scale, view.x, view.y);
-    drawSky(state);
-    drawItems(state);
-    drawPlane(state.player, state.elapsed);
+    if (state.shake > 0) {
+      const shake = state.shake * 14;
+      context.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    }
+
+    drawSky(context, camera, state.seed, state.time);
+    const runwayInView = state.runway && state.runway.z2 > camera.z + 20 && state.runway.z1 < camera.z + 920
+      ? state.runway
+      : null;
+    drawTerrain(context, camera, state.seed, state.z, runwayInView);
+    if (state.waypointZ > 0 && state.z < state.waypointZ) {
+      drawWaypointBeacon(context, camera, 0, state.waypointZ, (state.waypointZ - state.z) / 10);
+    }
+    for (const ring of state.rings) drawRing(context, camera, ring, state.time);
+    for (const hazard of state.hazards) {
+      if (hazard.kind === 1) drawBalloon(context, camera, hazard, state.time);
+      else drawBird(context, camera, hazard, state.time);
+    }
+
+    const { px, py } = aircraftScreenPosition(state);
+    const gearDown = state.altitude < 45 && state.speed < 160;
+    if (!(state.invulnerable > 0 && Math.floor(state.invulnerable * 10) % 2 === 1)) {
+      drawChaseViewAircraft(context, px, py, state.bank, state.pitch, state.throttle, state.time, gearDown);
+    }
+    drawPopups(dt);
+
     if (screen === SCREEN_TITLE) {
-      TITLE_LINES[2] = bestLabel(best);
-      drawPanel('Sky Rush', TITLE_LINES, 'Press Enter or tap to take off');
+      drawPanel('SKY RUSH', [...TITLE_LINES, `Best score ${best}`], 'Press Enter or tap to take off');
       return;
     }
-    drawHud(state);
-    if (screen === SCREEN_PAUSED) drawPanel('Paused', PAUSED_LINES, 'Press P to resume');
-    else if (screen === SCREEN_OVER) {
-      OVER_LINES[0] = finalLabel(state.score);
-      OVER_LINES[1] = bestLabel(best);
-      OVER_LINES[2] = `Rings ${state.rings}  ·  Stars ${state.stars}  ·  Best combo ${state.bestCombo}`;
-      drawPanel('Game over', OVER_LINES, 'Press Enter or tap to fly again');
+    drawLitInstrumentHud(context, state);
+    if (screen === SCREEN_PAUSED) {
+      drawPanel('Paused', ['The sky will wait for you.'], 'Press P to resume');
+    } else if (screen === SCREEN_OVER) {
+      drawPanel('Game over', [
+        `Score ${state.score}`,
+        `Best ${best}`,
+        `Rings ${state.ringsHit}  ·  Best combo x${state.bestCombo}  ·  Level ${state.level + 1}`,
+      ], 'Press Enter or tap to fly again');
     }
+  }
+
+  /** A floating score popup above the aircraft, for a ring or a near miss. */
+  function addPopup(text) {
+    popups.push({ text, x: VIEW.width / 2, y: 330, ttl: 1.4 });
+    if (popups.length > 4) popups.shift();
   }
 
   resize();
   window.addEventListener('resize', resize);
-  return { draw };
+  return { draw, addPopup };
 }
